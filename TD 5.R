@@ -1,0 +1,182 @@
+set.seed(2025)
+
+# 0) Utilitaires --------------------------------------------------------------
+
+read_txt_any <- function(candidates, header = TRUE, row.names = 1) {
+  path <- NULL
+  for (p in candidates) if (file.exists(p)) { path <- p; break }
+  if (is.null(path)) {
+    stop(sprintf("Aucun des fichiers suivants n’a été trouvé: %s",
+                 paste(candidates, collapse = ", ")))
+  }
+  read.table(path, header = header, row.names = row.names, check.names = TRUE)
+}
+
+keep_nonzero_variance <- function(df) {
+  sapply(df, function(x) sd(x, na.rm = TRUE) > 0)
+}
+
+kfold_assign <- function(n, k = 5, seed = 2025) {
+  set.seed(seed)
+  if (k < 2) k <- 2
+  sample(rep(1:k, length.out = n))
+}
+
+# Construction d’une fonction de transformation pour la régression
+# degree = 1 -> X; degree = 2 -> X + X^2
+make_reg_transform <- function(kept_cols, degree = 1) {
+  force(kept_cols); force(degree)
+  function(df) {
+    X <- as.data.frame(df[, kept_cols, drop = FALSE])
+    if (degree == 1) return(X)
+    X2 <- X
+    for (nm in names(X2)) X2[[nm]] <- X2[[nm]]^2
+    names(X2) <- paste0(names(X), "_sq")
+    cbind(X, X2)
+  }
+}
+
+# CV régression (MSE) pour un degré donné
+cv_reg_mse <- function(X, y, kept_cols, degree = 1, k = 5, seed = 2025) {
+  folds <- kfold_assign(nrow(X), k, seed)
+  mse <- numeric(k)
+  transform_fun <- make_reg_transform(kept_cols, degree)
+  for (fold in 1:k) {
+    idx_te <- which(folds == fold)
+    idx_tr <- setdiff(seq_len(nrow(X)), idx_te)
+    Xtr <- transform_fun(X[idx_tr, , drop = FALSE])
+    Xte <- transform_fun(X[idx_te, , drop = FALSE])
+    df_tr <- data.frame(Xtr, y = y[idx_tr])
+    fit <- lm(y ~ ., data = df_tr)
+    pred <- as.numeric(predict(fit, newdata = Xte))
+    mse[fold] <- mean((y[idx_te] - pred)^2)
+  }
+  mean(mse)
+}
+
+# CV classification (accuracy) pour une méthode donnée: "lda" ou "qda"
+cv_cla_accuracy <- function(X, y, method = "lda", k = 5, seed = 2025) {
+  folds <- kfold_assign(nrow(X), k, seed)
+  acc <- numeric(0)
+  for (fold in 1:k) {
+    idx_te <- which(folds == fold)
+    idx_tr <- setdiff(seq_len(nrow(X)), idx_te)
+    df_tr <- data.frame(X[idx_tr, , drop = FALSE], y = y[idx_tr])
+    df_te <- data.frame(X[idx_te, , drop = FALSE], y = y[idx_te])
+    
+    fit <- try(
+      if (method == "lda") MASS::lda(y ~ ., data = df_tr, tol = 1.0e-4)
+      else MASS::qda(y ~ ., data = df_tr),
+      silent = TRUE
+    )
+    if (inherits(fit, "try-error")) return(NA_real_)
+    pred <- try(predict(fit, newdata = df_te)$class, silent = TRUE)
+    if (inherits(pred, "try-error")) return(NA_real_)
+    acc <- c(acc, mean(pred == df_te$y))
+  }
+  mean(acc)
+}
+
+# 1) Charger les données ------------------------------------------------------
+
+Xreg_full <- read_txt_any(c("a25_reg_app.txt",  "TP5_a25_reg_app.txt"))
+Xcla_full <- read_txt_any(c("a25_clas_app.txt", "TP5_a25_clas_app.txt"))
+
+if (!("y" %in% names(Xreg_full))) stop("La colonne 'y' manque (régression).")
+if (!("y" %in% names(Xcla_full))) stop("La colonne 'y' manque (classification).")
+
+# 2) Prétraitements ----------------------------------------------------
+
+# Régression
+y_reg <- as.numeric(Xreg_full$y)
+X_reg <- Xreg_full[, setdiff(names(Xreg_full), "y"), drop = FALSE]
+keep_reg <- keep_nonzero_variance(X_reg)
+X_reg <- X_reg[, keep_reg, drop = FALSE]
+reg_kept_cols <- colnames(X_reg)
+
+# Classification
+y_cla <- factor(Xcla_full$y)
+X_cla <- Xcla_full[, setdiff(names(Xcla_full), "y"), drop = FALSE]
+keep_cla <- keep_nonzero_variance(X_cla)
+X_cla <- X_cla[, keep_cla, drop = FALSE]
+clas_kept_cols <- colnames(X_cla)
+clas_levels <- levels(y_cla)
+
+# 3) Validation croisée et choix des modèles ---------------------------------
+
+# Régression: comparer degré 1 vs degré 2
+k_reg <- min(5, nrow(X_reg)); if (k_reg < 2) k_reg <- 2
+mse_deg1 <- cv_reg_mse(X_reg, y_reg, reg_kept_cols, degree = 1, k = k_reg, seed = 2025)
+mse_deg2 <- cv_reg_mse(X_reg, y_reg, reg_kept_cols, degree = 2, k = k_reg, seed = 2025)
+reg_degree <- if (mse_deg2 < mse_deg1) 2 else 1
+
+cat(sprintf("CV Régression (k=%d): MSE deg1 = %.4f, deg2 = %.4f -> choix: degré %d\n",
+            k_reg, mse_deg1, mse_deg2, reg_degree))
+
+# Classification: comparer LDA vs QDA
+k_cla <- min(5, nrow(X_cla)); if (k_cla < 2) k_cla <- 2
+acc_lda <- cv_cla_accuracy(X_cla, y_cla, method = "lda", k = k_cla, seed = 2025)
+acc_qda <- cv_cla_accuracy(X_cla, y_cla, method = "qda", k = k_cla, seed = 2025)
+
+# Gestion des échecs possibles de QDA (ou LDA)
+if (is.na(acc_lda) && is.na(acc_qda)) stop("LDA et QDA ont échoué en CV.")
+if (is.na(acc_qda)) {
+  clas_kind <- "lda"
+} else if (is.na(acc_lda)) {
+  clas_kind <- "qda"
+} else {
+  clas_kind <- if (acc_qda > acc_lda) "qda" else "lda"
+}
+
+cat(sprintf("CV Classification (k=%d): acc LDA = %s, acc QDA = %s -> choix: %s\n",
+            k_cla,
+            ifelse(is.na(acc_lda), "NA", sprintf("%.4f", acc_lda)),
+            ifelse(is.na(acc_qda), "NA", sprintf("%.4f", acc_qda)),
+            toupper(clas_kind)))
+
+# 4) Entraîner les modèles finaux sur tout l'échantillon ---------------------
+
+# Régression finale
+reg_transform <- make_reg_transform(reg_kept_cols, degree = reg_degree)
+df_reg <- data.frame(reg_transform(X_reg), y = y_reg)
+reg <- lm(y ~ ., data = df_reg)
+
+# Classification finale
+suppressPackageStartupMessages(library(MASS))
+df_cla <- data.frame(X_cla, y = y_cla)
+if (clas_kind == "lda") {
+  clas <- MASS::lda(y ~ ., data = df_cla, tol = 1.0e-4)
+} else {
+  clas <- MASS::qda(y ~ ., data = df_cla)
+}
+
+# 5) Fonctions demandées ------------------------------------------------------
+
+classifieur <- function(test_set) {
+  # test_set: data.frame avec uniquement les colonnes explicatives
+  suppressPackageStartupMessages(library(MASS))
+  Xnew <- test_set[, clas_kept_cols, drop = FALSE]
+  if (exists("clas_kind") && clas_kind == "qda") {
+    pred <- predict(clas, newdata = Xnew)$class
+  } else {
+    pred <- predict(clas, newdata = Xnew)$class
+  }
+  factor(pred, levels = clas_levels)
+}
+
+regresseur <- function(test_set) {
+  # test_set: data.frame avec uniquement les colonnes explicatives
+  Xnew <- test_set[, reg_kept_cols, drop = FALSE]
+  Xnew_design <- reg_transform(Xnew)
+  as.numeric(predict(reg, newdata = Xnew_design))
+}
+
+# 6) Sauvegarde ------------------------------------------------------
+
+save("classifieur", "regresseur",
+     "clas", "clas_kind", "clas_kept_cols", "clas_levels",
+     "reg", "reg_kept_cols", "reg_transform", "reg_degree",
+     file = "env.Rdata")
+
+cat("Fichier env.Rdata écrit.\n")
+cat("Taille (Mo):", round(file.info("env.Rdata")$size / 1024^2, 3), "\n")
