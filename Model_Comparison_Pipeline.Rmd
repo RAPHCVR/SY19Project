@@ -1,0 +1,703 @@
+---
+title: "Comprehensive Model Comparison Pipeline (Regression & Classification)"
+subtitle: "Cross-Validation Comparison of Multiple ML Algorithms"
+output: html_notebook
+---
+
+# Configuration et imports
+```{r setup, include=FALSE}
+
+# Configuration globale
+set.seed(2025)
+CV_K <- 5  # Nombre de folds pour la cross-validation
+
+# Packages requis
+required_packages <- c(
+  "MASS",           # LDA, QDA
+  "FNN",          # KNN
+  "glmnet",         # Ridge, Lasso, Elastic Net
+  "rpart",          # Decision Trees
+  "randomForest",   # Random Forest
+  "splines",        # Splines
+  "gam",           # GAM
+  "flexmix",        # Mixture of Experts
+  "mixtools",       # Mixture of Regressions
+  "mclust",         # Model-based clustering
+  "ISLR"#,           # Additional utilities
+  #"klaR"            # Regularized Discriminant Analysis (RDA)
+)
+
+# Vérifier et installer les packages manquants
+for (pkg in required_packages) {
+  cat(sprintf("Installation de %s...\n", pkg))
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, character.only = TRUE, quiet = TRUE)
+  }
+  library(pkg, character.only = TRUE, quiet = TRUE)
+}
+
+cat("Tous les packages sont chargés")
+```
+
+---
+
+# SECTION 1: Fonctions Utilitaires
+```{r utilities}
+
+# ============================================================================
+# 1.1 Utilitaires de base
+# ============================================================================
+
+#' Lire un fichier texte avec recherche en cascade
+#' @param candidates Vecteur de chemins à tester
+#' @param header Booléen pour l'en-tête
+#' @param row.names Index de la colonne des noms de lignes
+read_txt_any <- function(candidates, header = TRUE, row.names = 1) {
+  path <- NULL
+  for (p in candidates) if (file.exists(p)) { path <- p; break }
+  if (is.null(path)) {
+    stop(sprintf("Aucun des fichiers suivants n'a été trouvé: %s",
+                 paste(candidates, collapse = ", ")))
+  }
+  read.table(path, header = header, row.names = row.names, check.names = TRUE)
+}
+
+#' Filtrer les colonnes avec variance non-nulle
+#' @param df DataFrame à filtrer
+keep_nonzero_variance <- function(df) {
+  sapply(df, function(x) sd(x, na.rm = TRUE) > 0)
+}
+
+#' Créer les fold indices pour la k-fold cross-validation
+#' @param n Nombre d'observations
+#' @param k Nombre de folds
+#' @param seed Graine aléatoire
+kfold_assign <- function(n, k = 5, seed = 2025) {
+  set.seed(seed)
+  if (k < 2) k <- 2
+  sample(rep(1:k, length.out = n))
+}
+
+# ============================================================================
+# 1.2 Pipeline de cross-validation générique
+# ============================================================================
+
+#' Pipeline générique de CV pour régression
+#' @param X DataFrame de features
+#' @param y Vecteur de cible (numérique)
+#' @param model_fn Fonction de modélisation(X_tr, y_tr) -> modèle
+#' @param pred_fn Fonction de prédiction(modèle, X_te) -> prédictions
+#' @param k Nombre de folds
+#' @param seed Graine aléatoire
+cv_regression <- function(X, y, model_fn, pred_fn, k = 5, seed = 2025) {
+  folds <- kfold_assign(nrow(X), k, seed)
+  mse_scores <- numeric(k)
+  
+  for (fold in 1:k) {
+    idx_te <- which(folds == fold)
+    idx_tr <- setdiff(seq_len(nrow(X)), idx_te)
+    
+    Xtr <- X[idx_tr, , drop = FALSE]
+    ytr <- y[idx_tr]
+    Xte <- X[idx_te, , drop = FALSE]
+    yte <- y[idx_te]
+    
+    tryCatch({
+      fit <- model_fn(Xtr, ytr)
+      pred <- pred_fn(fit, Xte)
+      mse_scores[fold] <- mean((yte - pred)^2)
+    }, error = function(e) {
+      cat(sprintf("Erreur fold %d: %s\n", fold, e$message))
+      mse_scores[fold] <<- NA
+    })
+  }
+  
+  list(
+    metric = "MSE",
+    mean = mean(mse_scores, na.rm = TRUE),
+    sd = sd(mse_scores, na.rm = TRUE),
+    scores = mse_scores,
+    na_count = sum(is.na(mse_scores))
+  )
+}
+
+#' Pipeline générique de CV pour classification
+#' @param X DataFrame de features
+#' @param y Facteur de classe
+#' @param model_fn Fonction de modélisation(X_tr, y_tr) -> modèle
+#' @param pred_fn Fonction de prédiction(modèle, X_te) -> prédictions (vecteur de classes)
+#' @param k Nombre de folds
+#' @param seed Graine aléatoire
+cv_classification <- function(X, y, model_fn, pred_fn, k = 5, seed = 2025) {
+  folds <- kfold_assign(nrow(X), k, seed)
+  acc_scores <- numeric(k)
+  
+  for (fold in 1:k) {
+    idx_te <- which(folds == fold)
+    idx_tr <- setdiff(seq_len(nrow(X)), idx_te)
+    
+    Xtr <- X[idx_tr, , drop = FALSE]
+    ytr <- y[idx_tr]
+    Xte <- X[idx_te, , drop = FALSE]
+    yte <- y[idx_te]
+    
+    tryCatch({
+      fit <- model_fn(Xtr, ytr)
+      pred <- pred_fn(fit, Xte)
+      acc_scores[fold] <- mean(pred == yte)
+    }, error = function(e) {
+      cat(sprintf("Erreur fold %d: %s\n", fold, e$message))
+      acc_scores[fold] <<- NA
+    })
+  }
+  
+  list(
+    metric = "Accuracy",
+    mean = mean(acc_scores, na.rm = TRUE),
+    sd = sd(acc_scores, na.rm = TRUE),
+    scores = acc_scores,
+    na_count = sum(is.na(acc_scores))
+  )
+}
+
+# ============================================================================
+# 1.3 Utilitaires de sélection dimensionnelle (PCA, FDA)
+# ============================================================================
+
+#' Appliquer PCA pour la réduction dimensionnelle
+#' @param X DataFrame d'entrée
+#' @param var_threshold Pourcentage de variance expliquée à conserver (0-1)
+apply_pca <- function(X, var_threshold = 0.95) {
+  pca_obj <- prcomp(X, scale. = TRUE, center = TRUE)
+  var_cumsum <- cumsum(pca_obj$sdev^2) / sum(pca_obj$sdev^2)
+  
+  # Trouver le nombre de composantes nécessaires pour atteindre le seuil
+  n_comp <- min(which(var_cumsum >= var_threshold))
+  
+  list(
+    X_transformed = as.data.frame(pca_obj$x[, 1:n_comp, drop = FALSE]),
+    n_comp = n_comp,
+    var_retained = var_cumsum[n_comp]
+  )
+}
+
+#' Appliquer une centrage/normalisation uniquement aux colonnes numériques
+#' Les colonnes binaires (dummy variables) ne sont pas normalisées (déjà en 0/1)
+normalize_data <- function(X) {
+  X_norm <- X
+  
+  # Normaliser uniquement les colonnes numériques
+  for (col in colnames(X)) {
+    if (is.numeric(X[[col]])) {
+      # Vérifier que ce n'est pas une dummy variable (valeurs uniquement 0/1)
+      unique_vals <- unique(X[[col]])
+      if (!setequal(unique_vals, c(0, 1))) {
+        # Normaliser si ce n'est pas une dummy variable
+        X_norm[[col]] <- scale(X[[col]])[, 1]
+      }
+    }
+  }
+  
+  X_norm
+}
+
+#' Prétraiter les variables: convertir int en dummy encoding (0/1)
+#' @param X DataFrame d'entrée
+preprocess_variables <- function(X) {
+  X_processed <- X
+  cols_to_remove <- c()
+  
+  for (col in colnames(X)) {
+    # Convertir les colonnes de type integer en dummy variables
+    
+    if (is.integer(X_processed[[col]])) {
+      unique_vals <- unique(X_processed[[col]])
+      
+      # Créer une colonne binaire pour chaque catégorie (sauf la dernière pour éviter la colinéarité)
+      for (i in seq_len(length(unique_vals) - 1)) {
+        val <- unique_vals[i]
+        new_col_name <- paste0(col, "_", val)
+        X_processed[[new_col_name]] <- as.integer(X_processed[[col]] == val)
+      }
+      
+      # Marquer l'ancienne colonne pour suppression
+      cols_to_remove <- c(cols_to_remove, col)
+    }
+  }
+  
+  # Supprimer les colonnes originales de type integer
+  if (length(cols_to_remove) > 0) {
+    X_processed <- X_processed[, !colnames(X_processed) %in% cols_to_remove, drop = FALSE]
+  }
+  
+  X_processed
+}
+
+#' Obtenir les noms des colonnes numériques (pour les splines dans GAM)
+#' @param X DataFrame d'entrée
+get_numeric_cols <- function(X) {
+  colnames(X)[sapply(X, is.numeric)]
+}
+
+cat("Fonctions utilitaires chargées")
+```
+
+---
+
+# SECTION 2: Chargement et Prétraitement des Données
+```{r load_and_preprocess}
+
+# ============================================================================
+# 2.1 Charger les données
+# ============================================================================
+
+Xreg_full <- read_txt_any(c("a25_reg_app.txt",  "TP5_a25_reg_app.txt"))
+Xcla_full <- read_txt_any(c("a25_clas_app.txt", "TP5_a25_clas_app.txt"))
+
+if (!("y" %in% names(Xreg_full))) stop("Colonne 'y' manquante (régression).")
+if (!("y" %in% names(Xcla_full))) stop("Colonne 'y' manquante (classification).")
+
+cat("Données chargées\n")
+cat(sprintf("  - Régression: %d obs × %d var\n", nrow(Xreg_full), ncol(Xreg_full)))
+cat(sprintf("  - Classification: %d obs × %d var\n", nrow(Xcla_full), ncol(Xcla_full)))
+
+# ============================================================================
+# 2.2 Prétraitement régression
+# ============================================================================
+
+y_reg <- as.numeric(Xreg_full$y)
+X_reg_full <- Xreg_full[, setdiff(names(Xreg_full), "y"), drop = FALSE]
+
+# Filtrer les colonnes avec variance nulle
+keep_reg <- keep_nonzero_variance(X_reg_full)
+X_reg <- X_reg_full[, keep_reg, drop = FALSE]
+X_reg <- preprocess_variables(X_reg)  # Conversion en dummy variable des int
+X_reg <- normalize_data(X_reg)  # Normalisation
+
+cat(sprintf("Régression prétraitée: %d features sélectionnées\n", ncol(X_reg)))
+
+# ============================================================================
+# 2.3 Prétraitement classification
+# ============================================================================
+
+y_cla <- factor(Xcla_full$y)
+X_cla_full <- Xcla_full[, setdiff(names(Xcla_full), "y"), drop = FALSE]
+
+# Filtrer les colonnes avec variance nulle
+keep_cla <- keep_nonzero_variance(X_cla_full)
+X_cla <- X_cla_full[, keep_cla, drop = FALSE]
+#X_cla <- preprocess_variables(X_cla)  # Conversion en dummy variable des int
+X_cla <- normalize_data(X_cla)  # Normalisation
+
+cat(sprintf("Classification prétraitée: %d features sélectionnées (après prétraitement dont %d dummy variables)\n", ncol(X_cla), sum(grepl("_", colnames(X_cla)))))
+cat("Distribution des classes:\n")
+table(y_cla)
+```
+
+---
+
+# SECTION 3: Définition des Modèles (RÉGRESSION)
+```{r models_regression}
+
+# ============================================================================
+# 3.1 Modèles de régression
+# ============================================================================
+
+regression_models <- list(
+  # K-Nearest Neighbors (KNN)
+  knn_reg = list(
+    name = "KNN Regression",
+    model_fn = function(X, y) { list(X = X, y = y, k = 5) },
+    pred_fn = function(model, X_new) {
+      FNN::knn.reg(train = model$X, test = X_new, y = model$y, k = model$k)$pred
+    }
+  ),
+  
+  # Régression linéaire simple
+  lm_reg = list(
+    name = "Linear Regression (OLS)",
+    model_fn = function(X, y) { lm(y ~ ., data = data.frame(X, y = y)) },
+    pred_fn = function(model, X_new) { predict(model, newdata = X_new) }
+  ),
+  
+  # Ridge Regression
+  ridge_reg = list(
+    name = "Ridge Regression",
+    model_fn = function(X, y) {
+      glmnet::glmnet(as.matrix(X), y, alpha = 0, lambda = cv.glmnet(as.matrix(X), y, alpha = 0, nfolds = 5)$lambda.min)
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newx = as.matrix(X_new), s = model$lambda.min)[, 1]
+    }
+  ),
+  
+  # Lasso Regression
+  lasso_reg = list(
+    name = "Lasso Regression",
+    model_fn = function(X, y) {
+      glmnet::glmnet(as.matrix(X), y, alpha = 1, lambda = cv.glmnet(as.matrix(X), y, alpha = 1, nfolds = 5)$lambda.min)
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newx = as.matrix(X_new), s = model$lambda.min)[, 1]
+    }
+  ),
+  
+  # Elastic Net Regression
+  elasticnet_reg = list(
+    name = "Elastic Net Regression",
+    model_fn = function(X, y) {
+      glmnet::glmnet(as.matrix(X), y, alpha = 0.5, lambda = cv.glmnet(as.matrix(X), y, alpha = 0.5, nfolds = 5)$lambda.min)
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newx = as.matrix(X_new), s = model$lambda.min)[, 1]
+    }
+  ),
+  
+  # Decision Tree
+  tree_reg = list(
+    name = "Decision Tree Regression",
+    model_fn = function(X, y) {
+      rpart::rpart(y ~ ., data = data.frame(X, y = y), method = "anova")
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  ),
+  
+  # Random Forest
+  rf_reg = list(
+    name = "Random Forest Regression",
+    model_fn = function(X, y) {
+      randomForest::randomForest(y ~ ., data = data.frame(X, y = y), ntree = 100, mtry = max(1, ncol(X) %/% 3))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  ),
+  
+  # Bagging
+  bagging_reg = list(
+    name = "Bagging Regression",
+    model_fn = function(X, y) {
+      randomForest::randomForest(y ~ ., data = data.frame(X, y = y), ntree = 100, mtry = ncol(X))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  ),
+  
+  # Generalized Additive Models (GAM)
+  gam_reg = list(
+    name = "GAM (Generalized Additive Model)",
+    model_fn = function(X, y) {
+      # Utiliser uniquement les colonnes numériques pour les splines
+      numeric_cols <- get_numeric_cols(X)
+      if (length(numeric_cols) == 0) {
+        # Si pas de colonnes numériques, faire une régression simple
+        lm(y ~ ., data = data.frame(X, y = y))
+      } else {
+        # Créer la formule avec s(x, df=3) pour les colonnes numériques
+        spline_terms <- paste("s(", numeric_cols, ", df=3)", sep = "", collapse = "+")
+        factor_cols <- colnames(X)[!colnames(X) %in% numeric_cols]
+        
+        if (length(factor_cols) > 0) {
+          formula_str <- paste("y ~", spline_terms, "+", paste(factor_cols, collapse = "+"))
+        } else {
+          formula_str <- paste("y ~", spline_terms)
+        }
+        
+        fmla <- as.formula(formula_str)
+        gam::gam(fmla, data = data.frame(X, y = y))
+      }
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  )
+)
+
+cat(sprintf("%d modèles de régression définis\n", length(regression_models)))
+```
+
+---
+
+# SECTION 4: Définition des Modèles (CLASSIFICATION)
+```{r models_classification}
+
+# ============================================================================
+# 4.1 Modèles de classification
+# ============================================================================
+
+classification_models <- list(
+  # K-Nearest Neighbors (KNN)
+  knn_cla = list(
+    name = "KNN Classification",
+    model_fn = function(X, y) { list(X = X, y = y, k = 5) },
+    pred_fn = function(model, X_new) {
+      FNN::knn(train = model$X, test = X_new, cl = model$y, k = model$k)
+    }
+  ),
+  
+  # Logistic Regression (via GLM)
+  logistic_cla = list(
+    name = "Logistic Regression",
+    model_fn = function(X, y) {
+      glm(y ~ ., family = binomial(), data = data.frame(X, y = y))
+    },
+    pred_fn = function(model, X_new) {
+      prob <- predict(model, newdata = X_new, type = "response")
+      factor(ifelse(prob > 0.5, levels(model$data$y)[2], levels(model$data$y)[1]),
+             levels = levels(model$data$y))
+    }
+  ),
+  
+  # Linear Discriminant Analysis (LDA)
+  lda_cla = list(
+    name = "Linear Discriminant Analysis (LDA)",
+    model_fn = function(X, y) {
+      MASS::lda(y ~ ., data = data.frame(X, y = y))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)$class
+    }
+  ),
+  
+  # Quadratic Discriminant Analysis (QDA)
+  qda_cla = list(
+    name = "Quadratic Discriminant Analysis (QDA)",
+    model_fn = function(X, y) {
+      MASS::qda(y ~ ., data = data.frame(X, y = y))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)$class
+    }
+  ),
+  
+  # Regularized Discriminant Analysis (RDA)
+  rda_cla = list(
+    name = "Regularized Discriminant Analysis (RDA)",
+    model_fn = function(X, y) {
+      klaR::rda(y ~ ., data = data.frame(X, y = y), lambda = 0.5, gamma = 0.5)
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)$class
+    }
+  ),
+  
+  # Decision Tree
+  tree_cla = list(
+    name = "Decision Tree Classification",
+    model_fn = function(X, y) {
+      rpart::rpart(y ~ ., data = data.frame(X, y = y), method = "class")
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new, type = "class")
+    }
+  ),
+  
+  # Random Forest
+  rf_cla = list(
+    name = "Random Forest Classification",
+    model_fn = function(X, y) {
+      randomForest::randomForest(y ~ ., data = data.frame(X, y = y), ntree = 100, mtry = max(1, ncol(X) %/% 3))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  ),
+  
+  # Bagging
+  bagging_cla = list(
+    name = "Bagging Classification",
+    model_fn = function(X, y) {
+      randomForest::randomForest(y ~ ., data = data.frame(X, y = y), ntree = 100, mtry = ncol(X))
+    },
+    pred_fn = function(model, X_new) {
+      predict(model, newdata = X_new)
+    }
+  ),
+  
+  # Generalized Additive Models (GAM)
+  gam_cla = list(
+    name = "GAM (Classification)",
+    model_fn = function(X, y) {
+      # Utiliser uniquement les colonnes numériques pour les splines
+      numeric_cols <- get_numeric_cols(X)
+      if (length(numeric_cols) == 0) {
+        # Si pas de colonnes numériques, faire une régression logistique simple
+        glm(y ~ ., family = binomial(), data = data.frame(X, y = y))
+      } else {
+        # Créer la formule avec s(x, df=3) pour les colonnes numériques
+        spline_terms <- paste("s(", numeric_cols, ", df=3)", sep = "", collapse = "+")
+        factor_cols <- colnames(X)[!colnames(X) %in% numeric_cols]
+        
+        if (length(factor_cols) > 0) {
+          formula_str <- paste("y ~", spline_terms, "+", paste(factor_cols, collapse = "+"))
+        } else {
+          formula_str <- paste("y ~", spline_terms)
+        }
+        
+        fmla <- as.formula(formula_str)
+        gam::gam(fmla, data = data.frame(X, y = y), family = binomial())
+      }
+    },
+    pred_fn = function(model, X_new) {
+      prob <- predict(model, newdata = X_new, type = "response")
+      factor(ifelse(prob > 0.5, levels(model$data$y)[2], levels(model$data$y)[1]),
+             levels = levels(model$data$y))
+    }
+  )
+)
+
+cat(sprintf("%d modèles de classification définis\n", length(classification_models)))
+```
+
+---
+
+# SECTION 5: Exécution du Pipeline - RÉGRESSION
+```{r pipeline_regression}
+
+# ============================================================================
+# 5.1 Exécution de la cross-validation pour tous les modèles (régression)
+# ============================================================================
+
+cat("\n", strrep("=", 80), "\n")
+cat("PIPELINE RÉGRESSION: Cross-Validation de tous les modèles\n")
+cat(strrep("=", 80), "\n\n")
+
+regression_results <- list()
+
+for (model_name in names(regression_models)) {
+  model_info <- regression_models[[model_name]]
+  cat(sprintf("[%s] %s...\n", model_name, model_info$name))
+  
+  result <- tryCatch({
+    cv_regression(X_reg, y_reg, 
+                  model_info$model_fn, 
+                  model_info$pred_fn, 
+                  k = CV_K, 
+                  seed = 2025)
+  }, error = function(e) {
+    cat(sprintf("ERREUR: %s\n", e$message))
+    list(metric = "MSE", mean = NA, sd = NA, scores = rep(NA, CV_K), na_count = CV_K)
+  })
+  
+  if (!is.na(result$mean)) {
+    cat(sprintf("MSE: %.6f (±%.6f)\n", result$mean, result$sd))
+  } else {
+    cat(sprintf("Échec (tous les folds échoués)\n"))
+  }
+  
+  regression_results[[model_name]] <- result
+  cat("\n")
+}
+
+# Créer un tableau de résumé pour la régression
+regression_summary <- data.frame(
+  Model = names(regression_results),
+  Model_Name = sapply(regression_models[names(regression_results)], function(m) m$name),
+  MSE_Mean = sapply(regression_results, function(r) r$mean),
+  MSE_SD = sapply(regression_results, function(r) r$sd),
+  Failed_Folds = sapply(regression_results, function(r) r$na_count),
+  stringsAsFactors = FALSE
+)
+
+# Trier par MSE moyen
+regression_summary <- regression_summary[order(regression_summary$MSE_Mean, na.last = TRUE), ]
+
+cat("\n", strrep("=", 80), "\n")
+cat("TABLEAU RÉCAPITULATIF: RÉGRESSION\n")
+cat(strrep("=", 80), "\n")
+print(regression_summary)
+cat("\n")
+```
+
+---
+
+# SECTION 6: Exécution du Pipeline - CLASSIFICATION
+```{r pipeline_classification}
+
+# ============================================================================
+# 6.1 Exécution de la cross-validation pour tous les modèles (classification)
+# ============================================================================
+
+cat("\n", strrep("=", 80), "\n")
+cat("PIPELINE CLASSIFICATION: Cross-Validation de tous les modèles\n")
+cat(strrep("=", 80), "\n\n")
+
+classification_results <- list()
+
+for (model_name in names(classification_models)) {
+  model_info <- classification_models[[model_name]]
+  cat(sprintf("[%s] %s...\n", model_name, model_info$name))
+  
+  result <- tryCatch({
+    cv_classification(X_cla, y_cla, 
+                      model_info$model_fn, 
+                      model_info$pred_fn, 
+                      k = CV_K, 
+                      seed = 2025)
+  }, error = function(e) {
+    cat(sprintf("ERREUR: %s\n", e$message))
+    list(metric = "Accuracy", mean = NA, sd = NA, scores = rep(NA, CV_K), na_count = CV_K)
+  })
+  
+  if (!is.na(result$mean)) {
+    cat(sprintf("Accuracy: %.4f (±%.4f)\n", result$mean, result$sd))
+  } else {
+    cat(sprintf("Échec (tous les folds échoués)\n"))
+  }
+  
+  classification_results[[model_name]] <- result
+  cat("\n")
+}
+
+# Créer un tableau de résumé pour la classification
+classification_summary <- data.frame(
+  Model = names(classification_results),
+  Model_Name = sapply(classification_models[names(classification_results)], function(m) m$name),
+  Accuracy_Mean = sapply(classification_results, function(r) r$mean),
+  Accuracy_SD = sapply(classification_results, function(r) r$sd),
+  Failed_Folds = sapply(classification_results, function(r) r$na_count),
+  stringsAsFactors = FALSE
+)
+
+# Trier par accuracy moyen (descendant)
+classification_summary <- classification_summary[order(classification_summary$Accuracy_Mean, na.last = TRUE, decreasing = TRUE), ]
+
+cat("\n", strrep("=", 80), "\n")
+cat("TABLEAU RÉCAPITULATIF: CLASSIFICATION\n")
+cat(strrep("=", 80), "\n")
+print(classification_summary)
+cat("\n")
+```
+
+---
+
+# SECTION 7: Visualisations et Comparaisons
+```{r visualizations}
+
+# ============================================================================
+# 7.1 Visualisation comparative - Régression
+# ============================================================================
+
+cat("Génération des visualisations...\n")
+
+# Trier et préparer les données pour la visualisation
+reg_plot_data <- regression_summary[!is.na(regression_summary$MSE_Mean), ]
+reg_plot_data <- reg_plot_data[order(reg_plot_data$MSE_Mean), ]
+
+cat("\n--- TOP 10 Modèles de RÉGRESSION (par MSE) ---\n")
+print(head(reg_plot_data[, c("Model_Name", "MSE_Mean", "MSE_SD")], 10))
+
+# ============================================================================
+# 7.2 Visualisation comparative - Classification
+# ============================================================================
+
+cla_plot_data <- classification_summary[!is.na(classification_summary$Accuracy_Mean), ]
+cla_plot_data <- cla_plot_data[order(cla_plot_data$Accuracy_Mean, decreasing = TRUE), ]
+
+cat("\n--- TOP 10 Modèles de CLASSIFICATION (par Accuracy) ---\n")
+print(head(cla_plot_data[, c("Model_Name", "Accuracy_Mean", "Accuracy_SD")], 10))
+```
+
