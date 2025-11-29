@@ -1,0 +1,335 @@
+---
+title: "Projet SY19 : Analyse et Prédiction de la Demande de Vélos à Séoul"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Fixer la seed globale pour la reproductibilité
+set.seed(42)
+```
+
+# 1. Chargement des données et des librairies
+
+Nous commençons par charger les librairies nécessaires et le jeu de données.
+
+```{r libraries}
+# Chargement des packages
+library(corrplot)   # Visualisation des corrélations
+library(glmnet)     # Ridge, Lasso, Elastic Net
+library(leaps)      # Sélection de variables (regsubsets)
+library(pls)        # PCR, PLS
+library(splines)    # Splines
+library(gam)        # GAM
+library(rpart)      # Arbres de décision
+library(rpart.plot) # Plot arbres
+library(randomForest) # Forêts aléatoires
+library(xgboost)    # Gradient Boosting
+library(kernlab)    # SVM
+library(nnet)       # Réseaux de neurones
+library(FNN)        # KNN Regression
+```
+
+```{r load_data}
+# Chargement des données
+data_path <- "seoul+bike+sharing+demand/SeoulBikeData.csv"
+df <- read.csv(data_path, fileEncoding = "latin1")
+
+# Nettoyage des noms de colonnes
+colnames(df) <- c("Date", "RentedBikeCount", "Hour", "Temperature", "Humidity", 
+                  "WindSpeed", "Visibility", "DewPointTemp", "SolarRadiation", 
+                  "Rainfall", "Snowfall", "Seasons", "Holiday", "FunctioningDay")
+
+# Conversion des types
+df$Date <- as.Date(df$Date, format = "%d/%m/%Y")
+df$Seasons <- as.factor(df$Seasons)
+df$Holiday <- as.factor(df$Holiday)
+
+# Filtrage des jours non fonctionnels
+# Quand FunctioningDay est "No", le nombre de vélos loués est toujours 0.
+# Ces observations n'apportent pas d'information utile pour la régression (on sait que c'est 0).
+# On ne garde que les jours fonctionnels et on supprime la colonne.
+df <- df[df$FunctioningDay == "Yes", ]
+df$FunctioningDay <- NULL
+
+# Extraction de caractéristiques temporelles
+df$Month <- as.factor(format(df$Date, "%m"))
+df$Weekday <- as.factor(format(df$Date, "%u"))
+
+# Suppression de la colonne Date brute
+df$Date <- NULL
+
+summary(df)
+```
+
+# 2. Analyse descriptive et choix de la tâche
+
+## Justification de la tâche
+
+La variable cible intéressante ici est **RentedBikeCount**, qui est une variable quantitative continue. Nous sommes donc face à un problème de **régression**.
+
+## Exploration des Données
+
+Nous allons visualiser la distribution de la variable cible, les relations avec les autres variables, et les corrélations.
+
+```{r descriptive_plots, fig.width=10, fig.height=8}
+# 1. Distribution de la cible
+par(mfrow=c(1,1))
+hist(df$RentedBikeCount, breaks=30, col="steelblue", border="white", 
+     main="Distribution du nombre de vélos loués", xlab="RentedBikeCount")
+
+# 2. Boxplots pour les variables quantitatives (détection d'outliers)
+# Identification des variables numériques
+nums <- sapply(df, is.numeric)
+num_vars <- names(nums)[nums]
+
+par(mfrow=c(3,3)) # Grille pour afficher plusieurs plots
+for (v in num_vars) {
+  boxplot(df[[v]], main=v, col="orange", border="brown")
+}
+par(mfrow=c(1,1)) # Reset
+
+# 3. Relations Vélos loués vs Autres variables
+# On trace RentedBikeCount en fonction de chaque variable explicative
+vars <- colnames(df)
+vars <- vars[vars != "RentedBikeCount"]
+
+par(mfrow=c(3,3))
+for (v in vars) {
+  if (is.numeric(df[[v]])) {
+    # Scatterplot pour variables numériques
+    plot(df[[v]], df$RentedBikeCount, main=paste("Vs", v), 
+         xlab=v, ylab="Vélos", pch=19, col=rgb(0,0,0,0.1), cex=0.5)
+  } else {
+    # Boxplot pour variables catégorielles
+    boxplot(df$RentedBikeCount ~ df[[v]], main=paste("Vs", v), 
+            xlab=v, ylab="Vélos", col="lightblue")
+  }
+}
+par(mfrow=c(1,1))
+```
+
+```{r correlation, fig.width=12, fig.height=12}
+# 4. Heatmap des corrélations
+cor_matrix <- cor(df[, nums])
+
+# Utilisation de corrplot
+corrplot::corrplot(abs(cor_matrix), method = "color", col.lim=c(0, 1))
+
+```
+
+**Observations :**
+
+-   Forte corrélation entre `Temperature` et `DewPointTemp` (risque de multicolinéarité).
+
+-   Les composantes liées au climat sont davantages corrélées entre elles
+
+-   Il existe une corrélation notable entre l'heure/température et la variable cible
+
+# 3. Préparation et Stratégie de Validation
+
+## Traitement des Variables Qualitatives (Encodage)
+
+Nos données contiennent des variables catégorielles (Seasons, Holiday, Month, Weekday). La plupart des algorithmes de machine learning (comme la régression linéaire, Ridge/Lasso, SVM, XGBoost) nécessitent des entrées numériques.
+
+Nous allons utiliser l'encodage **One-Hot** (ou *dummy variables*). Cela consiste à créer une colonne binaire pour chaque modalité d'une variable catégorielle (moins une pour éviter la colinéarité parfaite dans les modèles linéaires non régularisés, bien que `glmnet` gère cela).
+
+Dans R, la fonction `model.matrix()` effectue cette transformation automatiquement. Nous l'utiliserons pour préparer les matrices de design `X` pour les modèles qui ne gèrent pas nativement les formules avec facteurs (comme `glmnet` et `xgboost`). Pour les autres (comme `lm` ou `randomForest`), R gère souvent cela en interne via les formules, mais pour assurer la cohérence de la validation croisée, nous utiliserons souvent la matrice explicite.
+
+## Découpage Train/Test et Validation Croisée
+
+Nous divisons les données manuellement : 80% pour l'entraînement, 20% pour le test. Nous créons ensuite des **folds** (plis) manuels pour la validation croisée afin de garantir que tous les modèles utilisent exactement les mêmes partitions.
+
+```{r split_data}
+set.seed(123)
+n <- nrow(df)
+train_indices <- sample(1:n, size = 0.9 * n)
+
+data_train <- df[train_indices, ]
+data_test  <- df[-train_indices, ]
+
+# Création des 5 folds pour la validation croisée
+# On attribue aléatoirement un numéro de fold (1 à 5) à chaque observation d'entraînement
+k_folds <- 5
+folds <- sample(rep(1:k_folds, length.out = nrow(data_train)))
+
+print(paste("Taille Train:", nrow(data_train)))
+print(paste("Taille Test:", nrow(data_test)))
+```
+
+# 4. Entraînement et Comparaison des Modèles (Boucle CV)
+
+Nous allons itérer sur les 5 folds. Pour chaque fold $k$ : 1. On entraîne sur les 4 autres folds. 2. On prédit sur le fold $k$. 3. On calcule le RMSE.
+
+Cela permet une comparaison rigoureuse "toutes choses égales par ailleurs".
+
+```{r cv_loop}
+# Initialisation du tableau de résultats
+results_rmse <- data.frame(matrix(ncol = 0, nrow = k_folds))
+results_rmse$Fold <- 1:k_folds
+
+# Préparation des matrices pour les modèles qui ne supportent pas les formules (glmnet, xgboost)
+# On crée la matrice complète sur le train set pour assurer l'encodage cohérent (One-Hot)
+x_matrix <- model.matrix(RentedBikeCount ~ ., data = data_train)
+y_vector <- data_train$RentedBikeCount
+
+# Boucle de Validation Croisée
+for(i in 1:k_folds) {
+  cat("Traitement du Fold", i, "...\n")
+  
+  # Indices
+  idx_val <- which(folds == i)
+  idx_train <- which(folds != i)
+  
+  # Sous-ensembles Data Frame
+  train_fold <- data_train[idx_train, ]
+  val_fold   <- data_train[idx_val, ]
+  
+  # Sous-ensembles Matrices (pour glmnet/xgb)
+  x_train_fold <- x_matrix[idx_train, ]
+  y_train_fold <- y_vector[idx_train]
+  x_val_fold   <- x_matrix[idx_val, ]
+  y_val_fold   <- y_vector[idx_val]
+  
+  # --- 1. Régression Linéaire (OLS) ---
+  fit_lm <- lm(RentedBikeCount ~ ., data = train_fold)
+  pred_lm <- predict(fit_lm, val_fold)
+  results_rmse$LM[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_lm)^2))
+  
+  # --- 2. Stepwise (AIC) ---
+  # On part du modèle complet et on fait un step backward/forward rapide
+  fit_step <- step(fit_lm, direction = "both", trace = 0)
+  pred_step <- predict(fit_step, val_fold)
+  results_rmse$Stepwise[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_step)^2))
+  
+  # --- 3. Ridge (glmnet alpha=0) ---
+  # On utilise cv.glmnet INTERNE pour trouver lambda, mais on évalue sur le fold EXTERNE
+  cv_ridge <- cv.glmnet(x_train_fold, y_train_fold, alpha = 0)
+  pred_ridge <- predict(cv_ridge, newx = x_val_fold, s = "lambda.min")
+  results_rmse$Ridge[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_ridge)^2))
+  
+  # --- 4. Lasso (glmnet alpha=1) ---
+  cv_lasso <- cv.glmnet(x_train_fold, y_train_fold, alpha = 1)
+  pred_lasso <- predict(cv_lasso, newx = x_val_fold, s = "lambda.min")
+  results_rmse$Lasso[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_lasso)^2))
+  
+  # --- 5. PCR (Principal Component Regression) ---
+  fit_pcr <- pcr(RentedBikeCount ~ ., data = train_fold, scale = TRUE, validation = "none")
+  # On choisit arbitrairement un nombre de composants ou on le fixe
+  # TODO : CV interne pour choisir ncomp
+  pred_pcr <- predict(fit_pcr, val_fold, ncomp = 10)
+  results_rmse$PCR[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_pcr)^2))
+  
+  # --- 6. KNN (K-Nearest Neighbors) ---
+  # Nécessite des données numériques normalisées. On utilise la matrice x_matrix déjà encodée.
+  # On doit scaler manuellement pour KNN
+  x_train_scaled <- scale(x_train_fold)
+  # On applique le scaling du train sur le val
+  x_val_scaled <- scale(x_val_fold, center = attr(x_train_scaled, "scaled:center"), 
+                        scale = attr(x_train_scaled, "scaled:scale"))
+  
+  pred_knn <- knn.reg(train = x_train_scaled, test = x_val_scaled, y = y_train_fold, k = 5)$pred
+  results_rmse$KNN[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_knn)^2))
+  
+  # --- 7. SVM (Support Vector Machine) ---
+  fit_svm <- ksvm(RentedBikeCount ~ ., data = train_fold, kernel = "rbfdot")
+  pred_svm <- predict(fit_svm, val_fold)
+  results_rmse$SVM[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_svm)^2))
+  
+  # --- 8. Arbre de Décision (CART) ---
+  fit_rpart <- rpart(RentedBikeCount ~ ., data = train_fold)
+  pred_rpart <- predict(fit_rpart, val_fold)
+  results_rmse$CART[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_rpart)^2))
+  
+  # --- 9. Random Forest ---
+  fit_rf <- randomForest(RentedBikeCount ~ ., data = train_fold, ntree = 50)
+  pred_rf <- predict(fit_rf, val_fold)
+  results_rmse$RF[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_rf)^2))
+  
+  # --- 10. XGBoost ---
+  # XGBoost nécessite une DMatrix
+  dtrain <- xgb.DMatrix(data = x_train_fold, label = y_train_fold)
+  dval   <- xgb.DMatrix(data = x_val_fold)
+  
+  params <- list(objective = "reg:squarederror", eta = 0.1, max_depth = 6)
+  fit_xgb <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+  pred_xgb <- predict(fit_xgb, dval)
+  results_rmse$XGBoost[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_xgb)^2))
+  
+  # --- 11. GAM (Splines) ---
+  # Exemple simple avec s() sur Temperature et Humidity TODO : trouver d'autres usages
+  fit_gam <- gam(RentedBikeCount ~ s(Temperature) + s(Humidity) + Seasons + Hour, data = train_fold)
+  pred_gam <- predict(fit_gam, val_fold)
+  results_rmse$GAM[i] <- sqrt(mean((val_fold$RentedBikeCount - pred_gam)^2))
+}
+```
+
+# 5. Analyse des Résultats
+
+Comparons les performances moyennes (RMSE) de chaque modèle sur les 5 folds.
+
+```{r results_analysis}
+# Calcul de la moyenne et écart-type par modèle
+means <- colMeans(results_rmse[, -1], na.rm = TRUE)
+sds <- apply(results_rmse[, -1], 2, sd, na.rm = TRUE)
+
+summary_results <- data.frame(Model = names(means), Mean_RMSE = means, SD_RMSE = sds)
+summary_results <- summary_results[order(summary_results$Mean_RMSE), ]
+
+print(summary_results)
+
+# Visualisation (Boxplot)
+par(mar=c(5, 8, 4, 2)) # Marge gauche plus grande pour les noms
+boxplot(results_rmse[, -1], horizontal = TRUE, las = 1, 
+        main = "Comparaison des Modèles (RMSE sur 5-Fold CV)", 
+        xlab = "RMSE", col = "lightblue")
+```
+
+# 6. Test Final du Meilleur Modèle
+
+Nous sélectionnons le modèle ayant le RMSE moyen le plus bas et nous l'entraînons sur **tout** l'ensemble d'entraînement avant de l'évaluer sur l'ensemble de test final.
+
+```{r final_evaluation}
+best_model_name <- as.character(summary_results$Model[1])
+cat("Le meilleur modèle sélectionné est :", best_model_name, "\n")
+
+# Ré-entraînement sur tout le data_train et prédiction sur data_test
+
+final_preds <- NULL
+
+# Préparation matrices finales
+x_train_full <- model.matrix(RentedBikeCount ~ ., data = data_train)
+y_train_full <- data_train$RentedBikeCount
+x_test_full  <- model.matrix(RentedBikeCount ~ ., data = data_test)
+
+dtrain_full <- xgb.DMatrix(data = x_train_full, label = y_train_full)
+dtest_full  <- xgb.DMatrix(data = x_test_full)
+
+params <- list(objective = "reg:squarederror", eta = 0.1, max_depth = 6)
+final_model <- xgb.train(params = params, data = dtrain_full, nrounds = 100, verbose = 0)
+final_preds <- predict(final_model, dtest_full)
+
+# Calcul des métriques finales
+rmse_test <- sqrt(mean((data_test$RentedBikeCount - final_preds)^2))
+r2_test <- 1 - (sum((data_test$RentedBikeCount - final_preds)^2) / sum((data_test$RentedBikeCount - mean(data_test$RentedBikeCount))^2))
+
+cat("=== RÉSULTATS FINAUX SUR LE TEST SET ===\n")
+cat("RMSE :", rmse_test, "\n")
+cat("R²   :", r2_test, "\n")
+
+# Plot
+plot(data_test$RentedBikeCount, final_preds, 
+     main = paste("Performance Finale -", best_model_name),
+     xlab = "Valeurs Réelles", ylab = "Valeurs Prédites",
+     pch = 19, col = rgb(0, 0.5, 0, 0.5))
+abline(0, 1, col = "red", lty = 2, lwd = 2)
+par(mfrow=c(1,1))
+importance_matrix <- xgb.importance(model = final_model)
+xgb.plot.importance(importance_matrix,
+                    cex = 0.3)
+```
