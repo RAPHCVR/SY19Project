@@ -1,0 +1,286 @@
+---
+title: "Projet SY19 : Apprentissage Supervisé et Sélection de Modèles"
+subtitle: "Analyse sur données simulées et prédiction de la demande de vélos à Séoul"
+author: "Groupe : D2_P1_F"
+date: "06/12/2025"
+output: 
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+geometry: margin=2cm
+fontsize: 11pt
+header-includes:
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.align = 'center', fig.pos = 'H', fig.height = 4)
+
+set.seed(2025) 
+
+# Chargement des librairies nécessaires
+library(glmnet)     # Régression pénalisée
+library(klaR)       # RDA
+library(MASS)       # LDA/QDA
+library(xgboost)    # Gradient Boosting
+library(ggplot2)    # Graphiques
+library(gridExtra)  # Mise en page
+library(corrplot)   # Corrélation
+```
+
+# 1. Introduction
+
+Ce projet s'inscrit dans le cadre de SY19 et vise à comparer et sélectionner les meilleures méthodes d'apprentissage supervisé pour répondre à trois problématiques distinctes :
+
+1.  Une tâche de régression sur données simulées.
+
+2.  Une tâche de classification sur données simulées.
+
+3.  Une analyse prédictive sur un jeu de données réel.
+
+Notre méthodologie repose sur le principe du compromis biais-variance. Pour chaque tâche, nous avons comparé des modèles linéaires (LDA, OLS) à des modèles plus flexibles ou régularisés (RDA, Elastic Net, Boosting), en utilisant la validation croisée pour optimiser les hyperparamètres et éviter le sur-apprentissage.
+
+# 2. Données Simulées
+
+Nous disposons de deux jeux de données (`a25_reg_app.txt` et `a25_clas_app.txt`). L'objectif est de construire des prédicteurs performants évalués sur une plateforme externe.
+
+```{r load_simu, echo=FALSE}
+# Fonction de chargement
+read_data <- function(filename) {
+  if (file.exists(filename)) return(read.table(filename, header = TRUE, row.names = 1))
+  if (file.exists(paste0("TP5_", filename))) return(read.table(paste0("TP5_", filename), header = TRUE, row.names = 1))
+  stop("Fichier introuvable.")
+}
+df_reg <- read_data("a25_reg_app.txt")
+df_cla <- read_data("a25_clas_app.txt")
+```
+
+## 2.1 Régression (Minimisation de la MSE)
+
+### Analyse et Méthodologie
+
+Le jeu de données comporte 500 observations et 100 variables explicatives. Le nombre élevé de variables par rapport au nombre d'observations suggère un risque de sur-apprentissage avec une régression linéaire standard (OLS).
+
+Nous avons comparé :
+
+-   La régression linéaire simple (OLS)
+
+-   La régression Ridge (pénalité $L_2$)
+
+-   La régression Lasso (pénalité $L_1$)
+
+-   L'Elastic Net (combinaison des deux).
+
+L'Elastic Net s'est avéré le plus pertinent car il permet de sélectionner les variables importantes (propriété du Lasso) tout en gérant les groupes de variables corrélées (propriété du Ridge).
+
+### Optimisation du modèle
+
+Nous avons effectué une recherche sur grille (Grid Search) pour le paramètre de mélange $\alpha$ et le paramètre de régularisation $\lambda$. La validation croisée à 10 folds a révélé qu'un $\alpha = 0.7$ proposait le meilleur compromis (MSE estimée la plus basse).
+
+```{r reg_model, fig.height=3.5}
+y_reg <- df_reg$y
+X_reg <- as.matrix(df_reg[, -which(names(df_reg) == "y")])
+
+# Paramètre alpha optimisé via nos tests préliminaires
+best_alpha <- 0.7
+
+# Recherche du meilleur lambda par validation croisée
+cv_reg <- cv.glmnet(X_reg, y_reg, alpha = best_alpha, nfolds = 10)
+plot(cv_reg)
+title("MSE en fonction de Lambda (Elastic Net)", line = 2.5)
+
+    
+best_lambda <- cv_reg$lambda.min
+final_model_reg <- glmnet(X_reg, y_reg, alpha = best_alpha, lambda = best_lambda)
+
+cat(sprintf("Paramètres retenus : Alpha = %.1f, Lambda = %.4f\n", 
+            best_alpha, best_lambda))
+            
+cat(sprintf("MSE estimée par Validation Croisée : %.2f\n", min(cv_reg$cvm)))
+```
+
+## 2.2 Classification (Maximisation du taux de bon classement)
+
+### Analyse et Méthodologie
+
+La variable cible est binaire. Nous avons comparé la LDA (Analyse Discriminante Linéaire) et la QDA (Quadratique). La QDA offrait de meilleures performances brutes, suggérant des frontières de décision non-linéaires, mais avec une variance élevée.
+
+Nous avons retenu la RDA (Regularized Discriminant Analysis). Cette méthode introduit deux hyperparamètres ($\gamma$ et $\lambda$) permettant d'interpoler entre la LDA, la QDA et une estimation diagonale des matrices de covariance, permettant ainsi une bonne robustesse.
+
+### Résultats
+
+Après optimisation sur grille, les paramètres retenus sont $\gamma=0$ (pas de diagonalisation forcée) et $\lambda=0.6$ (mélange favorisant la QDA mais régularisé vers la LDA).
+
+```{r cla_model}
+y_cla <- factor(df_cla$y)
+X_cla <- df_cla[, -which(names(df_cla) == "y")]
+
+# Paramètres optimaux issus de notre Grid Search
+final_gamma <- 0.0
+final_lambda <- 0.6
+
+# Entraînement du modèle final
+final_model_cla <- klaR::rda(y ~ ., data = data.frame(X_cla, y = y_cla), 
+                             gamma = final_gamma, lambda = final_lambda)
+
+cat(sprintf("Modèle final : RDA avec Gamma=%.1f et Lambda=%.1f\n", final_gamma, final_lambda))
+
+pred_train <- predict(final_model_cla, newdata = X_cla)$class
+acc_train <- mean(pred_train == y_cla)
+cat(sprintf("Taux de bonne classification (Apprentissage) : %.2f%%\n", acc_train * 100))
+```
+
+## 2.3 Formatage pour la soumission (Fichier .Rdata)
+
+Pour répondre aux contraintes de la plateforme d'évaluation, nous avons encapsulé nos modèles finaux dans deux fonctions autonomes (`regresseur` et `classifieur`) avec les librairies nécessaires et la transformation des données.
+
+```{r submission_code, eval=FALSE}
+# Fonction de régression
+regresseur <- function(test_set) {
+  library(glmnet)
+  X_mat <- as.matrix(test_set)
+  return(as.numeric(predict(final_model_reg, newx = X_mat)))
+}
+
+# Fonction de classification
+classifieur <- function(test_set) {
+  library(klaR)
+  library(MASS)
+  pred <- predict(final_model_cla, newdata = test_set)
+  return(pred$class)
+}
+```
+
+\newpage
+
+# 3. Données Réelles : Seoul Bike Sharing Demand
+
+## 3.1 Présentation et Objectif
+
+Nous avons choisi le jeu de données "Seoul Bike Sharing Demand" (UCI Repository).
+
+L'objectif est de prédire le nombre de vélos loués par heure (`RentedBikeCount`) en fonction des conditions météorologiques (température, humidité, vent, etc.) et temporelles. Il s'agit donc d'un problème de régression.
+
+## 3.2 Prétraitement des données (Preprocessing)
+
+Le nettoyage des données est une étape importante pour ce jeu de données :
+
+1.  Ingénierie des variables : Extraction du mois, de l'année et du jour de la semaine pour capturer la saisonnalité.
+
+2.  Filtrage : Suppression des lignes où `Functioning Day = "No"`, car le nombre de locations est nul par définition (service fermé).
+
+3.  Transformation de la cible : La distribution de `RentedBikeCount` étant très asymétrique, nous appliquons une transformation logarithmique $Y' = \log(1 + Y)$. Cela stabilise la variance et améliore la performance des modèles.
+
+4.  Encodage : Les variables catégorielles (Saisons, Vacances) sont transformées en variables binaires (One-Hot Encoding).
+
+```{r real_prep, echo=FALSE}
+# Chargement
+df_real <- read.csv("SeoulBikeData.csv", fileEncoding = "latin1")
+# Renommage
+colnames(df_real) <- c("Date", "RentedBikeCount", "Hour", "Temperature", "Humidity", 
+                  "WindSpeed", "Visibility", "DewPointTemp", "SolarRadiation", 
+                  "Rainfall", "Snowfall", "Seasons", "Holiday", "FunctioningDay")
+
+# 1. Feature Engineering 
+# Extraction des composantes temporelles avant suppression de la date brute
+df_real$DateObj <- as.Date(df_real$Date, format="%d/%m/%Y")
+df_real$Month <- as.factor(format(df_real$DateObj, "%m"))
+df_real$Year  <- as.factor(format(df_real$DateObj, "%Y"))
+df_real$Weekday <- as.factor(format(df_real$DateObj, "%u"))
+
+# 2. Nettoyage
+df_real$DateObj <- NULL
+df_real$Date <- NULL 
+
+# 3. Filtrage (Jours fonctionnels uniquement)
+df_real <- df_real[df_real$FunctioningDay == "Yes", ]
+df_real$FunctioningDay <- NULL
+
+# 4. Séparation Train/Test (80% / 20%)
+set.seed(2025) # Fixé pour la reproductibilité du découpage
+sample_idx <- sample(1:nrow(df_real), size = 0.8 * nrow(df_real))
+train <- df_real[sample_idx, ]
+test  <- df_real[-sample_idx, ]
+
+# Visualisation
+par(mfrow=c(1,2))
+hist(train$RentedBikeCount, main="Distribution Originale", col="lightblue", xlab="Vélos")
+hist(log1p(train$RentedBikeCount), main="Log(1+Y)", col="lightgreen", xlab="Log(Vélos)")
+```
+
+## 3.3 Modélisation : Gradient Boosting (XGBoost)
+
+Contrairement aux données simulées linéaires, ce problème réel implique des interactions complexes (ex: la pluie affecte moins les locations s'il fait déjà très froid) et des non-linéarités. Nous avons choisi XGBoost, une méthode ensembliste basée sur des arbres de décision.
+
+Nous avons utilisé les matrices `xgb.DMatrix` pour optimiser le calcul et avons réglé les hyperparamètres suivants (via recherche aléatoire préalable) :
+
+-   `max_depth=7` : Pour capturer des interactions modérément complexes.
+
+-   `eta=0.06` : Un taux d'apprentissage faible pour une meilleure convergence.
+
+-   `subsample` & `colsample` : Pour introduire de l'aléatoire et réduire le sur-apprentissage.
+
+```{r xgboost_train}
+# Préparation des matrices (Gestion automatique du One-Hot Encoding via model.matrix)
+X_train_mat <- model.matrix(RentedBikeCount ~ . -1, data = train)
+X_test_mat  <- model.matrix(RentedBikeCount ~ . -1, data = test)
+
+dtrain <- xgb.DMatrix(data = X_train_mat, label = log1p(train$RentedBikeCount))
+dtest  <- xgb.DMatrix(data = X_test_mat, label = log1p(test$RentedBikeCount))
+
+# Paramètres optimisés
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.06,                # Taux d'apprentissage
+  max_depth = 7,             # Profondeur de l'arbre
+  subsample = 0.63,          # Stochasticité sur les lignes
+  colsample_bytree = 0.96,   # Stochasticité sur les colonnes
+  alpha = 0.75,              # Régularisation L1 (Lasso)
+  lambda = 1.68              # Régularisation L2 (Ridge)
+)
+
+# Entraînement
+bst_model <- xgb.train(params = params, data = dtrain, nrounds = 754, verbose = 0)
+```
+
+## 3.4 Résultats et Évaluation
+
+Les prédictions sont re-transformées vers l'échelle originale via l'exponentielle ($e^{y'} - 1$).
+
+```{r eval_res, echo=FALSE}
+# Prédiction
+pred_log <- predict(bst_model, dtest)
+pred_final <- expm1(pred_log)
+
+# Métriques
+rmse <- sqrt(mean((test$RentedBikeCount - pred_final)^2))
+r2 <- 1 - (sum((test$RentedBikeCount - pred_final)^2) / 
+             sum((test$RentedBikeCount - mean(test$RentedBikeCount))^2))
+
+cat(sprintf("RMSE sur le jeu de Test : %.2f\n", rmse))
+cat(sprintf("R² (Variance expliquée) : %.4f\n", r2))
+```
+
+Avec un $R^2$ d'environ 0.95, le modèle explique une très grande partie de la variance. L'analyse de l'importance des variables montre que la Température et l'Heure sont les facteurs déterminants, suivis de la pluie.
+
+```{r var_imp, echo=FALSE, fig.height=4}
+importance <- xgb.importance(model = bst_model)
+xgb.plot.importance(importance_matrix = importance, top_n = 10, main = "Top 10 Variables Importantes")
+```
+
+# 4. Conclusion
+
+Ce projet nous a permis de mettre en pratique différentes stratégies de modélisation.
+
+Sur les données simulées, caractérisées par un bruit important mais une structure sous-jacente linéaire, les méthodes de régularisation (Elastic Net pour la régression, RDA pour la classification) se sont montrées supérieures. Elles ont permis de filtrer le bruit et d'éviter le sur-apprentissage là où les méthodes classiques (OLS, QDA) échouaient.
+
+Sur les données réelles, la complexité des relations entre les variables a nécessité une approche non-linéaire. L'utilisation de XGBoost, combinée à un prétraitement adéquat (transformation logarithmique), a permis d'atteindre une excellente précision prédictive.
+
+# 5. Références
+
+1.  **Données Simulées** : Fournies dans le cadre de l'UV.
+2.  **Données Réelles** : *Seoul Bike Sharing Demand Data Set*, UCI Machine Learning Repository. Disponible sur : <https://archive.ics.uci.edu/ml/datasets/Seoul+Bike+Sharing+Demand>
