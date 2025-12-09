@@ -6,8 +6,7 @@ date: "06/12/2025"
 output: 
   pdf_document:
     number_sections: true
-    toc: true
-    toc_depth: 2
+    toc: false
     fig_caption: true
 geometry: margin=2cm
 fontsize: 11pt
@@ -18,7 +17,7 @@ header-includes:
 ```{r setup, include=FALSE}
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
-                      fig.align = 'center', fig.pos = 'H', fig.height = 4)
+                      fig.align = 'center', fig.pos = 'H', fig.height = 3)
 
 set.seed(2025) 
 
@@ -32,7 +31,7 @@ library(gridExtra)  # Mise en page
 library(corrplot)   # Corrélation
 ```
 
-# 1. Introduction
+# Introduction
 
 Ce projet s'inscrit dans le cadre de SY19 et vise à comparer et sélectionner les meilleures méthodes d'apprentissage supervisé pour répondre à trois problématiques distinctes :
 
@@ -44,7 +43,7 @@ Ce projet s'inscrit dans le cadre de SY19 et vise à comparer et sélectionner l
 
 Notre méthodologie repose sur le principe du compromis biais-variance. Pour chaque tâche, nous avons comparé des modèles linéaires (LDA, OLS) à des modèles plus flexibles ou régularisés (RDA, Elastic Net, Boosting), en utilisant la validation croisée pour optimiser les hyperparamètres et éviter le sur-apprentissage.
 
-# 2. Données Simulées
+# Données Simulées
 
 Nous disposons de deux jeux de données (`a25_reg_app.txt` et `a25_clas_app.txt`). L'objectif est de construire des prédicteurs performants évalués sur une plateforme externe.
 
@@ -59,7 +58,47 @@ df_reg <- read_data("a25_reg_app.txt")
 df_cla <- read_data("a25_clas_app.txt")
 ```
 
-## 2.1 Régression (Minimisation de la MSE)
+## Analyse exploratoire (EDA)
+
+### Régression — vue d’ensemble
+
+```{r simu_reg_eda}
+# Dimensions et résumé
+cat(sprintf("Régression: n=%d, p=%d\n", nrow(df_reg), ncol(df_reg)-1))
+summary(df_reg$y)
+
+# Valeurs manquantes
+na_reg <- colSums(is.na(df_reg))
+na_reg[na_reg > 0]
+
+# Distribution de y (compact)
+ggplot(df_reg, aes(x = y)) + 
+  geom_histogram(fill = "steelblue", bins = 30) + 
+  labs(title = "Distribution de y (régression)")
+```
+
+### Classification — vue d’ensemble
+
+```{r simu_cla_eda}
+# Dimensions et balance des classes
+cat(sprintf("Classification: n=%d, p=%d\n", nrow(df_cla), ncol(df_cla)-1))
+table(df_cla$y)
+prop.table(table(df_cla$y))
+
+# Valeurs manquantes
+na_cla <- colSums(is.na(df_cla))
+na_cla[na_cla > 0]
+
+# PCA colorée par classe
+Xc <- df_cla[, -which(names(df_cla)=="y")]
+pc_c <- prcomp(scale(Xc), center = TRUE, scale. = TRUE)
+pc_df <- data.frame(pc_c$x[,1:2], y = factor(df_cla$y))
+ggplot(pc_df, aes(PC1, PC2, color = y)) + 
+  geom_point(alpha = 0.6) + 
+  labs(title = "PCA (2 premières composantes) - classes")
+```
+
+## Régression (Minimisation de la MSE)
 
 ### Analyse et Méthodologie
 
@@ -103,7 +142,19 @@ cat(sprintf("Paramètres retenus : Alpha = %.1f, Lambda = %.4f\n",
 cat(sprintf("MSE estimée par Validation Croisée : %.2f\n", min(cv_reg$cvm)))
 ```
 
-## 2.2 Classification (Maximisation du taux de bon classement)
+### Diagnostics du modèle de régression
+
+```{r simu_reg_diag}
+y_hat <- as.numeric(predict(final_model_reg, newx = X_reg))
+res <- y_reg - y_hat
+par(mfrow = c(1,2))
+plot(y_hat, res, pch = 19, col = "darkgray",
+  main = "Résidus vs prédictions", xlab = "ŷ", ylab = "résidus")
+qqnorm(res); qqline(res, col = "red")
+cat(sprintf("MSE (apprentissage): %.4f\n", mean(res^2)))
+```
+
+## Classification (Maximisation du taux de bon classement)
 
 ### Analyse et Méthodologie
 
@@ -134,7 +185,25 @@ acc_train <- mean(pred_train == y_cla)
 cat(sprintf("Taux de bonne classification (Apprentissage) : %.2f%%\n", acc_train * 100))
 ```
 
-## 2.3 Formatage pour la soumission (Fichier .Rdata)
+### Évaluation du classifieur (matrice de confusion, ROC)
+
+```{r simu_cla_eval, message=FALSE}
+library(pROC)
+pred <- predict(final_model_cla, newdata = X_cla)
+pred_class <- pred$class
+conf <- table(Vérité = y_cla, Prédiction = pred_class)
+conf
+acc <- sum(diag(conf))/sum(conf)
+cat(sprintf("Exactitude (apprentissage): %.3f\n", acc))
+
+if (!is.null(pred$posterior) && ncol(pred$posterior) == 2) {
+  pos_level <- levels(y_cla)[2]
+  roc_obj <- roc(response = y_cla, predictor = pred$posterior[, pos_level])
+  cat(sprintf("AUC (apprentissage): %.3f\n", auc(roc_obj)))
+}
+```
+
+## Formatage pour la soumission (Fichier .Rdata)
 
 Pour répondre aux contraintes de la plateforme d'évaluation, nous avons encapsulé nos modèles finaux dans deux fonctions autonomes (`regresseur` et `classifieur`) avec les librairies nécessaires et la transformation des données.
 
@@ -155,17 +224,15 @@ classifieur <- function(test_set) {
 }
 ```
 
-\newpage
+# Données Réelles : Seoul Bike Sharing Demand
 
-# 3. Données Réelles : Seoul Bike Sharing Demand
-
-## 3.1 Présentation et Objectif
+## Présentation et Objectif
 
 Nous avons choisi le jeu de données "Seoul Bike Sharing Demand" (UCI Repository).
 
 L'objectif est de prédire le nombre de vélos loués par heure (`RentedBikeCount`) en fonction des conditions météorologiques (température, humidité, vent, etc.) et temporelles. Il s'agit donc d'un problème de régression.
 
-## 3.2 Prétraitement des données (Preprocessing)
+## Prétraitement des données (Preprocessing)
 
 Le nettoyage des données est une étape importante pour ce jeu de données :
 
@@ -212,7 +279,7 @@ hist(train$RentedBikeCount, main="Distribution Originale", col="lightblue", xlab
 hist(log1p(train$RentedBikeCount), main="Log(1+Y)", col="lightgreen", xlab="Log(Vélos)")
 ```
 
-## 3.3 Modélisation : Gradient Boosting (XGBoost)
+## Modélisation : Gradient Boosting (XGBoost)
 
 Contrairement aux données simulées linéaires, ce problème réel implique des interactions complexes (ex: la pluie affecte moins les locations s'il fait déjà très froid) et des non-linéarités. Nous avons choisi XGBoost, une méthode ensembliste basée sur des arbres de décision.
 
@@ -272,7 +339,7 @@ importance <- xgb.importance(model = bst_model)
 xgb.plot.importance(importance_matrix = importance, top_n = 10, main = "Top 10 Variables Importantes")
 ```
 
-# 4. Conclusion
+# Conclusion
 
 Ce projet nous a permis de mettre en pratique différentes stratégies de modélisation.
 
@@ -280,7 +347,7 @@ Sur les données simulées, caractérisées par un bruit important mais une stru
 
 Sur les données réelles, la complexité des relations entre les variables a nécessité une approche non-linéaire. L'utilisation de XGBoost, combinée à un prétraitement adéquat (transformation logarithmique), a permis d'atteindre une excellente précision prédictive.
 
-# 5. Références
+# Références
 
 1.  **Données Simulées** : Fournies dans le cadre de l'UV.
 2.  **Données Réelles** : *Seoul Bike Sharing Demand Data Set*, UCI Machine Learning Repository. Disponible sur : <https://archive.ics.uci.edu/ml/datasets/Seoul+Bike+Sharing+Demand>
